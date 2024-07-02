@@ -7,7 +7,6 @@ import ActivityCalendar from "@/components/ActivityCalendar";
 import Empty from "@/components/Empty";
 import Icon from "@/components/Icon";
 import showMemoEditorDialog from "@/components/MemoEditor/MemoEditorDialog";
-import MemoFilter from "@/components/MemoFilter";
 import MemoView from "@/components/MemoView";
 import MobileHeader from "@/components/MobileHeader";
 import { TimelineSidebar, TimelineSidebarDrawer } from "@/components/TimelineSidebar";
@@ -29,7 +28,7 @@ const Timeline = () => {
   const memoStore = useMemoStore();
   const memoList = useMemoList();
   const [, setLastVisited] = useLocalStorage<string>("lastVisited", Routes.TIMELINE);
-  const { tag: tagQuery, text: textQuery } = useFilterWithUrlParams();
+  const filter = useFilterWithUrlParams();
   const [activityStats, setActivityStats] = useState<Record<string, number>>({});
   const [selectedDateString, setSelectedDateString] = useState<string>(new Date().toDateString());
   const [isRequesting, setIsRequesting] = useState(true);
@@ -44,21 +43,11 @@ const Timeline = () => {
   useEffect(() => {
     memoList.reset();
     fetchMemos("");
-  }, [selectedDateString, tagQuery, textQuery]);
+  }, [selectedDateString, filter.text, filter.tag, filter.memoPropertyFilter]);
 
   useEffect(() => {
     (async () => {
       const filters = [`row_status == "NORMAL"`];
-      const contentSearch: string[] = [];
-      if (textQuery) {
-        contentSearch.push(JSON.stringify(textQuery));
-      }
-      if (contentSearch.length > 0) {
-        filters.push(`content_search == [${contentSearch.join(", ")}]`);
-      }
-      if (tagQuery) {
-        filters.push(`tag == "${tagQuery}"`);
-      }
       const { stats } = await memoServiceClient.getUserMemosStats({
         name: user.name,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -79,14 +68,25 @@ const Timeline = () => {
     setIsRequesting(true);
     const filters = [`creator == "${user.name}"`, `row_status == "NORMAL"`];
     const contentSearch: string[] = [];
-    if (textQuery) {
-      contentSearch.push(JSON.stringify(textQuery));
+    if (filter.text) {
+      contentSearch.push(JSON.stringify(filter.text));
     }
     if (contentSearch.length > 0) {
       filters.push(`content_search == [${contentSearch.join(", ")}]`);
     }
-    if (tagQuery) {
-      filters.push(`tag == "${tagQuery}"`);
+    if (filter.tag) {
+      filters.push(`tag == "${filter.tag}"`);
+    }
+    if (filter.memoPropertyFilter) {
+      if (filter.memoPropertyFilter.hasLink) {
+        filters.push(`has_link == true`);
+      }
+      if (filter.memoPropertyFilter.hasTaskList) {
+        filters.push(`has_task_list == true`);
+      }
+      if (filter.memoPropertyFilter.hasCode) {
+        filters.push(`has_code == true`);
+      }
     }
     if (selectedDateString) {
       const selectedDateStamp = getTimeStampByDate(selectedDateString);
@@ -140,8 +140,6 @@ const Timeline = () => {
               </div>
             </div>
             <div className="w-full h-auto flex flex-col justify-start items-start">
-              <MemoFilter className="p-2 my-2 rounded-lg dark:bg-zinc-900" />
-
               <div className="flex flex-col justify-start items-start w-full mt-2">
                 <div className="w-full flex shrink-0 flex-row justify-between pl-1 mt-1 mb-3">
                   <div className="w-auto flex flex-col">
@@ -173,6 +171,7 @@ const Timeline = () => {
                       className="!border w-full !border-gray-100 dark:!border-zinc-700"
                       memo={memo}
                       displayTimeFormat="time"
+                      compact
                     />
                   ))}
                 </div>

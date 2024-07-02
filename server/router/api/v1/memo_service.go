@@ -12,10 +12,10 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/lithammer/shortuuid/v4"
 	"github.com/pkg/errors"
-	"github.com/yourselfhosted/gomark/ast"
-	"github.com/yourselfhosted/gomark/parser"
-	"github.com/yourselfhosted/gomark/parser/tokenizer"
-	"github.com/yourselfhosted/gomark/restore"
+	"github.com/usememos/gomark/ast"
+	"github.com/usememos/gomark/parser"
+	"github.com/usememos/gomark/parser/tokenizer"
+	"github.com/usememos/gomark/restore"
 	expr "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -78,7 +78,7 @@ func (s *APIV1Service) CreateMemo(ctx context.Context, request *v1pb.CreateMemoR
 	}
 	// Try to dispatch webhook when memo is created.
 	if err := s.DispatchMemoCreatedWebhook(ctx, memoMessage); err != nil {
-		slog.Warn("Failed to dispatch memo created webhook", err)
+		slog.Warn("Failed to dispatch memo created webhook", slog.Any("err", err))
 	}
 
 	return memoMessage, nil
@@ -254,7 +254,7 @@ func (s *APIV1Service) UpdateMemo(ctx context.Context, request *v1pb.UpdateMemoR
 			payload.Property = property
 			update.Payload = payload
 		} else if path == "uid" {
-			update.UID = &request.Memo.Name
+			update.UID = &request.Memo.Uid
 			if !util.UIDMatcher.MatchString(*update.UID) {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid resource name")
 			}
@@ -312,7 +312,7 @@ func (s *APIV1Service) UpdateMemo(ctx context.Context, request *v1pb.UpdateMemoR
 	}
 	// Try to dispatch webhook when memo is updated.
 	if err := s.DispatchMemoUpdatedWebhook(ctx, memoMessage); err != nil {
-		slog.Warn("Failed to dispatch memo updated webhook", err)
+		slog.Warn("Failed to dispatch memo updated webhook", slog.Any("err", err))
 	}
 
 	return memoMessage, nil
@@ -344,12 +344,17 @@ func (s *APIV1Service) DeleteMemo(ctx context.Context, request *v1pb.DeleteMemoR
 	if memoMessage, err := s.convertMemoFromStore(ctx, memo); err == nil {
 		// Try to dispatch webhook when memo is deleted.
 		if err := s.DispatchMemoDeletedWebhook(ctx, memoMessage); err != nil {
-			slog.Warn("Failed to dispatch memo deleted webhook", err)
+			slog.Warn("Failed to dispatch memo deleted webhook", slog.Any("err", err))
 		}
 	}
 
 	if err = s.Store.DeleteMemo(ctx, &store.DeleteMemo{ID: id}); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to delete memo")
+	}
+
+	// Delete memo relation
+	if err := s.Store.DeleteMemoRelation(ctx, &store.DeleteMemoRelation{MemoID: &id}); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to delete memo relations")
 	}
 
 	// Delete related resources.
@@ -361,6 +366,24 @@ func (s *APIV1Service) DeleteMemo(ctx context.Context, request *v1pb.DeleteMemoR
 		if err := s.Store.DeleteResource(ctx, &store.DeleteResource{ID: resource.ID}); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to delete resource")
 		}
+	}
+
+	// Delete memo comments
+	commentType := store.MemoRelationComment
+	relations, err := s.Store.ListMemoRelations(ctx, &store.FindMemoRelation{RelatedMemoID: &id, Type: &commentType})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list memo comments")
+	}
+	for _, relation := range relations {
+		if _, err := s.DeleteMemo(ctx, &v1pb.DeleteMemoRequest{Name: fmt.Sprintf("%s%d", MemoNamePrefix, relation.MemoID)}); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to delete memo comment")
+		}
+	}
+
+	// Delete memo references
+	referenceType := store.MemoRelationReference
+	if err := s.Store.DeleteMemoRelation(ctx, &store.DeleteMemoRelation{RelatedMemoID: &id, Type: &referenceType}); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to delete memo references")
 	}
 
 	return &emptypb.Empty{}, nil
@@ -545,7 +568,7 @@ func (s *APIV1Service) ExportMemos(ctx context.Context, request *v1pb.ExportMemo
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to convert memo")
 		}
-		file, err := writer.Create(time.Unix(memo.CreatedTs, 0).Format(time.RFC3339) + ".md")
+		file, err := writer.Create(time.Unix(memo.CreatedTs, 0).Format(time.RFC3339) + "-" + string(memo.Visibility) + ".md")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to create memo file")
 		}
@@ -846,10 +869,11 @@ func convertMemoPropertyFromStore(property *storepb.MemoPayload_Property) *v1pb.
 		return nil
 	}
 	return &v1pb.MemoProperty{
-		Tags:        property.Tags,
-		HasLink:     property.HasLink,
-		HasTaskList: property.HasTaskList,
-		HasCode:     property.HasCode,
+		Tags:               property.Tags,
+		HasLink:            property.HasLink,
+		HasTaskList:        property.HasTaskList,
+		HasCode:            property.HasCode,
+		HasIncompleteTasks: property.HasIncompleteTasks,
 	}
 }
 
@@ -968,6 +992,9 @@ func (s *APIV1Service) buildMemoFindWithFilter(ctx context.Context, find *store.
 		if filter.HasCode {
 			find.PayloadFind.HasCode = true
 		}
+		if filter.HasIncompleteTasks {
+			find.PayloadFind.HasIncompleteTasks = true
+		}
 	}
 
 	user, err := s.GetCurrentUser(ctx)
@@ -1021,24 +1048,26 @@ var SearchMemosFilterCELAttributes = []cel.EnvOption{
 	cel.Variable("has_link", cel.BoolType),
 	cel.Variable("has_task_list", cel.BoolType),
 	cel.Variable("has_code", cel.BoolType),
+	cel.Variable("has_incomplete_tasks", cel.BoolType),
 }
 
 type SearchMemosFilter struct {
-	ContentSearch     []string
-	Visibilities      []store.Visibility
-	Tag               *string
-	OrderByPinned     bool
-	DisplayTimeBefore *int64
-	DisplayTimeAfter  *int64
-	Creator           *string
-	UID               *string
-	RowStatus         *store.RowStatus
-	Random            bool
-	Limit             *int
-	IncludeComments   bool
-	HasLink           bool
-	HasTaskList       bool
-	HasCode           bool
+	ContentSearch      []string
+	Visibilities       []store.Visibility
+	Tag                *string
+	OrderByPinned      bool
+	DisplayTimeBefore  *int64
+	DisplayTimeAfter   *int64
+	Creator            *string
+	UID                *string
+	RowStatus          *store.RowStatus
+	Random             bool
+	Limit              *int
+	IncludeComments    bool
+	HasLink            bool
+	HasTaskList        bool
+	HasCode            bool
+	HasIncompleteTasks bool
 }
 
 func parseSearchMemosFilter(expression string) (*SearchMemosFilter, error) {
@@ -1117,6 +1146,9 @@ func findSearchMemosField(callExpr *expr.Expr_Call, filter *SearchMemosFilter) {
 			} else if idExpr.Name == "has_code" {
 				value := callExpr.Args[1].GetConstExpr().GetBoolValue()
 				filter.HasCode = value
+			} else if idExpr.Name == "has_incomplete_tasks" {
+				value := callExpr.Args[1].GetConstExpr().GetBoolValue()
+				filter.HasIncompleteTasks = value
 			}
 			return
 		}
@@ -1147,6 +1179,9 @@ func getMemoPropertyFromContent(content string) (*storepb.MemoPayload_Property, 
 			property.HasLink = true
 		case *ast.TaskList:
 			property.HasTaskList = true
+			if !n.Complete {
+				property.HasIncompleteTasks = true
+			}
 		case *ast.Code, *ast.CodeBlock:
 			property.HasCode = true
 		}
@@ -1208,22 +1243,22 @@ func (s *APIV1Service) dispatchMemoRelatedWebhook(ctx context.Context, memo *v1p
 			return errors.Wrap(err, "failed to convert memo to webhook payload")
 		}
 		payload.ActivityType = activityType
-		payload.URL = hook.URL
-		if err := webhook.Post(*payload); err != nil {
+		payload.Url = hook.URL
+		if err := webhook.Post(payload); err != nil {
 			return errors.Wrap(err, "failed to post webhook")
 		}
 	}
 	return nil
 }
 
-func convertMemoToWebhookPayload(memo *v1pb.Memo) (*webhook.WebhookPayload, error) {
+func convertMemoToWebhookPayload(memo *v1pb.Memo) (*v1pb.WebhookRequestPayload, error) {
 	creatorID, err := ExtractUserIDFromName(memo.Creator)
 	if err != nil {
 		return nil, errors.Wrap(err, "invalid memo creator")
 	}
-	return &webhook.WebhookPayload{
-		CreatorID: creatorID,
-		CreatedTs: time.Now().Unix(),
-		Memo:      memo,
+	return &v1pb.WebhookRequestPayload{
+		CreatorId:  creatorID,
+		CreateTime: timestamppb.New(time.Now()),
+		Memo:       memo,
 	}, nil
 }
